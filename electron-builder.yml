@@ -1,0 +1,46 @@
+# Display name for packaged builds only. NEVER set productName in package.json:
+# Electron reads it in dev and renames the app, which switches safeStorage to a
+# different Keychain key and orphans every stored secret (invariant 17). The
+# packaged app runs as "Aliax" and heals blobs written under the dev name on
+# first read (vault.ts decryptWithPastKey).
+appId: com.aliax.app
+productName: Aliax
+directories:
+  buildResources: build
+  output: release
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+# The LaunchAgent helper runs this script by absolute path, so it has to survive
+# packaging as a plain file rather than inside the asar (invariant 14).
+extraResources:
+  - from: resources/aliax-shim.mjs
+    to: aliax-shim.mjs
+  # Menu bar icons: read from disk at runtime, so they cannot live in the asar.
+  - from: build/trayTemplate.png
+    to: trayTemplate.png
+  - from: build/trayTemplate@2x.png
+    to: trayTemplate@2x.png
+mac:
+  icon: build/icon.icns
+  category: public.app-category.developer-tools
+  target:
+    - target: dir
+      arch: arm64
+  # Ad-hoc signing gives a stable identity across rebuilds, so macOS keeps the
+  # Keychain grants instead of re-prompting each time the app is replaced.
+  # `bun run release` overrides identity/target/notarize on the command line —
+  # the updater verifies each download's Developer ID signature, so release
+  # builds MUST be properly signed and notarized.
+  identity: null
+  hardenedRuntime: true
+  extendInfo:
+    NSAppleEventsUsageDescription: Aliax restarts your terminal sessions after switching accounts.
+
+# Update feed: a public repo holding only release artifacts, so the app can
+# poll it unauthenticated while the source stays private.
+publish:
+  provider: github
+  owner: LandonDev
+  repo: aliax-releases

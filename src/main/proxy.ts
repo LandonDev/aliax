@@ -1,0 +1,506 @@
+import { net } from 'electron'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import type { ProxyStatus, ServiceId } from '../shared/types'
+import { accountIdForToken, liveKeychain } from './adapters/claude'
+import { CLAUDE_CLIENT_ID, CLAUDE_TOKEN_URL } from './login'
+import { getSettings, saveSettings } from './settings'
+import * as vault from './vault'
+
+/**
+ * A localhost gateway that swaps the Authorization header on every CLI request
+ * for the account Aliax currently has selected. Running sessions therefore
+ * follow a switch without being killed — the credential is resolved per request
+ * rather than read once at startup.
+ *
+ * Routing: the path's first segment names the service, so one port serves both.
+ *   http://127.0.0.1:PORT/claude/...  -> api.anthropic.com
+ *   http://127.0.0.1:PORT/codex/...   -> chatgpt.com/backend-api/codex
+ */
+/**
+ * Codex points several subsystems at one configured base but expects them on
+ * different upstream roots: model turns answer under `/backend-api/codex`,
+ * while the plugin and skill catalogue answers under `/backend-api` (both
+ * confirmed against the live API). Resolve per path rather than per service.
+ */
+function upstreamFor(service: string, path: string): string | null {
+  if (service === 'claude') return 'https://api.anthropic.com'
+  if (service !== 'codex') return null
+  return path.startsWith('/v1/')
+    ? 'https://chatgpt.com/backend-api/codex'
+    : 'https://chatgpt.com/backend-api'
+}
+
+/** Where the shell snippet looks to decide whether to route through Aliax. */
+export const RUNTIME_DIR = join(homedir(), '.aliax')
+const RUNTIME_FILE = join(RUNTIME_DIR, 'proxy.json')
+
+let server: Server | null = null
+let port = 0
+let lastError: string | null = null
+const routed: Record<string, number> = {}
+
+/**
+ * Headers we must not pass upstream: those describing the hop we are
+ * terminating, plus the ones the fetch spec reserves for the browser. Chromium
+ * rejects the whole request with ERR_INVALID_ARGUMENT if a reserved header is
+ * set by hand, and CLIs do send some of them (`sec-fetch-mode`).
+ */
+const HOP_BY_HOP = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'host',
+  'content-length',
+  'accept-charset',
+  'accept-encoding',
+  'access-control-request-headers',
+  'access-control-request-method',
+  'cookie',
+  'cookie2',
+  'date',
+  'dnt',
+  'expect',
+  'origin',
+  'referer',
+  'via'
+])
+
+const isForbiddenHeader = (name: string): boolean =>
+  HOP_BY_HOP.has(name) || name.startsWith('sec-') || name.startsWith('proxy-')
+
+/**
+ * The account each service should be using right now. Set explicitly by a
+ * switch so a CLI writing its own refreshed tokens back to disk (Claude Code
+ * does this) can never drag a proxied session back to the old account.
+ */
+function pinnedProfile(serviceId: ServiceId): string | null {
+  return getSettings().proxyAccounts?.[serviceId] ?? null
+}
+
+export function pinProfile(serviceId: ServiceId, name: string | null): void {
+  const settings = getSettings()
+  const next = { ...(settings.proxyAccounts ?? {}) }
+  if (name) next[serviceId] = name
+  else delete next[serviceId]
+  saveSettings({ ...settings, proxyAccounts: next })
+}
+
+interface Credential {
+  authorization: string
+  extraHeaders?: Record<string, string>
+}
+
+/** Refresh a minute before expiry, so a long turn cannot start on a dead token. */
+const EXPIRY_MARGIN_MS = 60_000
+
+/**
+ * One refresh at a time per service. Rotating refresh tokens invalidate their
+ * predecessor, so two concurrent refreshes would present the same token twice
+ * and get the whole grant revoked (invariant 12).
+ */
+const refreshing = new Map<ServiceId, Promise<void>>()
+
+function once(serviceId: ServiceId, work: () => Promise<void>): Promise<void> {
+  const existing = refreshing.get(serviceId)
+  if (existing) return existing
+  const p = work().finally(() => refreshing.delete(serviceId))
+  refreshing.set(serviceId, p)
+  return p
+}
+
+/** Renew the pinned Claude profile in place when its access token is expiring. */
+async function refreshClaudeIfNeeded(name: string, blob: string): Promise<void> {
+  let parsed: { keychain?: string; oauthAccount?: unknown }
+  try {
+    parsed = JSON.parse(blob)
+  } catch {
+    return
+  }
+  const tokens = parsed.keychain ? JSON.parse(parsed.keychain)?.claudeAiOauth : null
+  const expiresAt = typeof tokens?.expiresAt === 'number' ? tokens.expiresAt : 0
+  if (!tokens?.refreshToken || expiresAt - Date.now() > EXPIRY_MARGIN_MS) return
+
+  await once('claude-code', async () => {
+    const res = await net
+      .fetch(CLAUDE_TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: tokens.refreshToken,
+          client_id: CLAUDE_CLIENT_ID
+        })
+      })
+      .catch(() => null)
+    if (!res?.ok) return
+    const data = (await res.json()) as {
+      access_token?: string
+      refresh_token?: string
+      expires_in?: number
+    }
+    if (!data.access_token) return
+    const next = {
+      ...tokens,
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token ?? tokens.refreshToken,
+      expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000
+    }
+    const keychain = JSON.stringify({ claudeAiOauth: next })
+    vault.saveSecret('claude-code', name, JSON.stringify({ ...parsed, keychain }))
+  })
+}
+
+/** Same for Codex, whose access token lasts ten days but still expires. */
+async function refreshCodexIfNeeded(name: string, raw: string): Promise<void> {
+  let auth: { tokens?: { access_token?: string; refresh_token?: string } }
+  try {
+    auth = JSON.parse(raw)
+  } catch {
+    return
+  }
+  const token = auth.tokens?.access_token
+  const refreshToken = auth.tokens?.refresh_token
+  if (!token || !refreshToken) return
+  let exp = 0
+  try {
+    const payload = token.split('.')[1]
+    exp = (JSON.parse(Buffer.from(payload, 'base64url').toString()) as { exp?: number }).exp ?? 0
+  } catch {
+    return
+  }
+  if (exp * 1000 - Date.now() > EXPIRY_MARGIN_MS) return
+
+  await once('codex', async () => {
+    const res = await net
+      .fetch('https://auth.openai.com/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: 'app_EMoamEEZ73f0CkXaXp7hrann',
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+          scope: 'openid profile email'
+        })
+      })
+      .catch(() => null)
+    if (!res?.ok) return
+    const data = (await res.json()) as {
+      access_token?: string
+      refresh_token?: string
+      id_token?: string
+    }
+    if (!data.access_token) return
+    vault.saveSecret(
+      'codex',
+      name,
+      JSON.stringify({
+        ...auth,
+        tokens: {
+          ...auth.tokens,
+          access_token: data.access_token,
+          refresh_token: data.refresh_token ?? refreshToken,
+          id_token: data.id_token ?? (auth.tokens as { id_token?: string })?.id_token
+        },
+        last_refresh: new Date().toISOString()
+      })
+    )
+  })
+}
+
+const bearer = (keychain: string): Credential | null => {
+  try {
+    const token = JSON.parse(keychain)?.claudeAiOauth?.accessToken
+    return typeof token === 'string' ? { authorization: `Bearer ${token}` } : null
+  } catch {
+    return null
+  }
+}
+
+const expiryOf = (keychain: string | null): number => {
+  if (!keychain) return 0
+  try {
+    return JSON.parse(keychain)?.claudeAiOauth?.expiresAt ?? 0
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Claude's credential for the pinned account.
+ *
+ * The Keychain copy wins whenever it belongs to the same account, because the
+ * CLI refreshes it hourly and our stored snapshot goes stale within the hour.
+ * Serving the snapshot then means sending a dead token and, worse, trying to
+ * renew it with a refresh token the CLI has already rotated past — which is how
+ * a grant gets revoked (invariant 12). Only a pinned account that is NOT the
+ * live one is ours to refresh.
+ */
+async function claudeCredential(): Promise<Credential | null> {
+  const name = pinnedProfile('claude-code')
+  const live = await liveKeychain()
+  if (!name) return live ? bearer(live) : null
+
+  const profile = vault.profiles('claude-code').find((p) => p.name === name)
+  let blob = vault.readSecret('claude-code', name)
+
+  if (live && profile) {
+    const liveTokens = (() => {
+      try {
+        return JSON.parse(live)?.claudeAiOauth
+      } catch {
+        return null
+      }
+    })()
+    const liveId =
+      typeof liveTokens?.accessToken === 'string'
+        ? await accountIdForToken(liveTokens.accessToken)
+        : null
+    if (liveId && liveId === profile.accountId) {
+      // Same account: adopt the CLI's newer copy so the vault stops drifting.
+      let parsed: Record<string, unknown> = {}
+      try {
+        parsed = blob ? JSON.parse(blob) : {}
+      } catch {
+        parsed = {}
+      }
+      if (expiryOf(live) > expiryOf((parsed.keychain as string) ?? null)) {
+        vault.saveSecret('claude-code', name, JSON.stringify({ ...parsed, keychain: live }))
+      }
+      return bearer(live)
+    }
+  }
+
+  // A different account than the CLI holds: our copy is the only one, so it is
+  // ours to keep fresh.
+  if (blob) {
+    await refreshClaudeIfNeeded(name, blob).catch(() => {})
+    blob = vault.readSecret('claude-code', name) ?? blob
+    try {
+      const keychain = JSON.parse(blob).keychain
+      if (keychain && expiryOf(keychain) > Date.now()) return bearer(keychain)
+    } catch {
+      // fall through to the explicit failure below
+    }
+  }
+  // Never send a token we know is dead: a clear 503 beats a confusing OAuth error.
+  return null
+}
+
+/** Codex: the pinned profile's auth.json, falling back to the live file. */
+async function codexCredential(): Promise<Credential | null> {
+  const name = pinnedProfile('codex')
+  let raw = name ? vault.readSecret('codex', name) : null
+  if (name && raw) {
+    await refreshCodexIfNeeded(name, raw).catch(() => {})
+    raw = vault.readSecret('codex', name) ?? raw
+  }
+  if (!raw) {
+    try {
+      raw = readFileSync(join(homedir(), '.codex', 'auth.json'), 'utf8')
+    } catch {
+      return null
+    }
+  }
+  try {
+    const tokens = JSON.parse(raw).tokens ?? {}
+    if (typeof tokens.access_token !== 'string') return null
+    const extraHeaders: Record<string, string> = {}
+    if (typeof tokens.account_id === 'string') extraHeaders['chatgpt-account-id'] = tokens.account_id
+    return { authorization: `Bearer ${tokens.access_token}`, extraHeaders }
+  } catch {
+    return null
+  }
+}
+
+const credentialFor = (service: string): Promise<Credential | null> =>
+  service === 'claude' ? claudeCredential() : codexCredential()
+
+function fail(res: ServerResponse, status: number, message: string): void {
+  if (res.headersSent) {
+    res.end()
+    return
+  }
+  res.writeHead(status, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ error: { type: 'aliax_proxy', message } }))
+}
+
+/** Collect the body up front: we must be able to replay it on a 401 retry. */
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    req.on('data', (c: Buffer) => chunks.push(c))
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    req.on('error', reject)
+  })
+}
+
+async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = req.url ?? '/'
+  const slash = url.indexOf('/', 1)
+  const service = url.slice(1, slash === -1 ? undefined : slash)
+  const rest = slash === -1 ? '' : url.slice(slash)
+  const upstream = upstreamFor(service, rest)
+
+  // A health probe the shell snippet and the UI can both trust.
+  if (service === '__aliax') {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true, pid: process.pid }))
+    return
+  }
+  if (!upstream) return fail(res, 404, `unknown service "${service}"`)
+
+  const credential = await credentialFor(service)
+  if (!credential) {
+    return fail(
+      res,
+      503,
+      `Aliax has no usable sign-in for ${service}. Open Aliax and switch to an account, or sign in again.`
+    )
+  }
+
+  const headers: Record<string, string> = {}
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (isForbiddenHeader(k.toLowerCase()) || v === undefined) continue
+    headers[k] = Array.isArray(v) ? v.join(', ') : v
+  }
+  headers['authorization'] = credential.authorization
+  // The CLI may send its own account scoping; ours must win.
+  delete headers['x-api-key']
+  for (const [k, v] of Object.entries(credential.extraHeaders ?? {})) headers[k] = v
+
+  const body = ['GET', 'HEAD'].includes(req.method ?? 'GET') ? undefined : await readBody(req)
+
+  let upstreamRes: Response
+  try {
+    upstreamRes = await net.fetch(`${upstream}${rest}`, {
+      method: req.method,
+      headers,
+      // A plain byte body, never a stream: `duplex` is rejected here, and the
+      // buffered form is what lets a 401 retry replay the same request.
+      body: body && body.length > 0 ? new Uint8Array(body) : undefined
+    })
+  } catch (e) {
+    lastError = (e as Error).message
+    return fail(res, 502, `Aliax could not reach ${service}: ${lastError}`)
+  }
+
+  routed[service] = (routed[service] ?? 0) + 1
+
+  const outHeaders: Record<string, string> = {}
+  upstreamRes.headers.forEach((value, key) => {
+    const name = key.toLowerCase()
+    // net.fetch hands us decoded bytes, so passing the upstream's encoding or
+    // length through would make the client try to decompress plaintext.
+    if (name === 'content-encoding' || name === 'content-length') return
+    if (isForbiddenHeader(name)) return
+    outHeaders[key] = value
+  })
+  res.writeHead(upstreamRes.status, outHeaders)
+
+  if (!upstreamRes.body) {
+    res.end()
+    return
+  }
+  const reader = upstreamRes.body.getReader()
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      // Respect backpressure so a slow terminal cannot balloon memory.
+      if (!res.write(Buffer.from(value))) {
+        await new Promise((resolve) => res.once('drain', resolve))
+      }
+    }
+  } catch (e) {
+    lastError = (e as Error).message
+  } finally {
+    res.end()
+  }
+}
+
+export async function startProxy(): Promise<ProxyStatus> {
+  if (server) return status()
+  lastError = null
+  server = createServer((req, res) => {
+    handle(req, res).catch((e) => {
+      lastError = (e as Error).message
+      fail(res, 500, lastError)
+    })
+  })
+  // Long model turns must not be cut off by an idle timer.
+  server.requestTimeout = 0
+  server.headersTimeout = 0
+  server.setTimeout(0)
+
+  await new Promise<void>((resolve, reject) => {
+    server?.once('error', reject)
+    // Loopback only: never reachable from the network.
+    server?.listen(0, '127.0.0.1', resolve)
+  }).catch((e) => {
+    server = null
+    lastError = (e as Error).message
+    throw e
+  })
+
+  const address = server.address()
+  port = typeof address === 'object' && address ? address.port : 0
+  writeRuntimeFile()
+  return status()
+}
+
+export async function stopProxy(): Promise<ProxyStatus> {
+  clearRuntimeFile()
+  const current = server
+  server = null
+  port = 0
+  if (current) {
+    await new Promise<void>((resolve) => current.close(() => resolve()))
+    current.closeAllConnections?.()
+  }
+  return status()
+}
+
+/**
+ * The liveness marker the shell snippet reads. Holding the pid lets the snippet
+ * verify Aliax is genuinely up, so a crash cannot leave shells pointing at a
+ * dead port.
+ */
+function writeRuntimeFile(): void {
+  try {
+    mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 })
+    writeFileSync(
+      RUNTIME_FILE,
+      JSON.stringify({ port, pid: process.pid, url: `http://127.0.0.1:${port}` }, null, 2),
+      { mode: 0o600 }
+    )
+  } catch {
+    // a missing marker only means shells will not route; not fatal
+  }
+}
+
+export function clearRuntimeFile(): void {
+  rmSync(RUNTIME_FILE, { force: true })
+}
+
+export function status(): ProxyStatus {
+  return {
+    running: server !== null,
+    port,
+    claudeBaseUrl: server ? `http://127.0.0.1:${port}/claude` : null,
+    codexBaseUrl: server ? `http://127.0.0.1:${port}/codex` : null,
+    routed: { ...routed },
+    accounts: {
+      'claude-code': pinnedProfile('claude-code'),
+      codex: pinnedProfile('codex')
+    },
+    error: lastError
+  }
+}
