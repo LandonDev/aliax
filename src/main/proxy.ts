@@ -346,7 +346,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const url = req.url ?? '/'
   const slash = url.indexOf('/', 1)
   const service = url.slice(1, slash === -1 ? undefined : slash)
-  const rest = slash === -1 ? '' : url.slice(slash)
+  let rest = slash === -1 ? '' : url.slice(slash)
+  // Codex builds its connector-runtime URL as <base>/api/codex/ps/mcp when
+  // the base (us) has no /backend-api marker — strip the doubled prefix so
+  // /ps/* resolves against the real codex backend.
+  if (service === 'codex' && rest.startsWith('/api/codex/')) {
+    rest = rest.slice('/api/codex'.length)
+  }
   const upstream = upstreamFor(service, rest)
 
   // A health probe the shell snippet and the UI can both trust.
@@ -427,6 +433,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 }
 
 export async function startProxy(): Promise<ProxyStatus> {
+
   if (server) return status()
   lastError = null
   server = createServer((req, res) => {
