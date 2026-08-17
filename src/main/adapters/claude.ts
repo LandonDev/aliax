@@ -171,25 +171,53 @@ const PLAN_PRICES: { match: RegExp; name: string; monthlyUsd: number }[] = [
   { match: /pro/, name: 'Pro', monthlyUsd: 20 }
 ]
 
+interface SubDetails {
+  next_charge_at?: string | null
+  plan_ending_at?: string | null
+  status?: string | null
+}
+
+const subCache = new Map<
+  string,
+  { at: number; data: { renewsAt?: number; cancelsAt?: number; status?: string } }
+>()
+
 /**
- * Next billing date from the subscription's anchor day. Months are uneven, so a
- * subscription anchored on the 31st bills on the last day of a short month —
- * clamping matches how Stripe actually charges.
+ * The real billing date, read from claude.ai's Stripe-backed subscription page
+ * with the account's own web session. The OAuth token carries no billing date,
+ * and a date projected from the signup day is wrong the moment a plan is upgraded
+ * mid-cycle: Stripe moves the charge day but leaves the signup day untouched. So
+ * a renewal date is only ever shown when this endpoint confirms it. Cached per
+ * session and org for an hour, skipped on a manual Refresh.
  */
-function nextRenewal(anchorIso: string, now: number): { renewsAt: number; anchorDay: number } | null {
-  const start = Date.parse(anchorIso)
-  if (Number.isNaN(start)) return null
-  // The anchor is a UTC instant — reading its day locally lands a day early
-  // for anyone west of GMT (Jan 28 02:28Z became the 27th here).
-  const anchorDay = new Date(start).getUTCDate()
-  const d = new Date(now)
-  const clampTo = (year: number, month: number): Date => {
-    const lastDay = new Date(year, month + 1, 0).getDate()
-    return new Date(year, month, Math.min(anchorDay, lastDay), 12, 0, 0, 0)
+async function verifiedSubscription(
+  sessionKey: string,
+  orgUuid: string,
+  force?: boolean
+): Promise<{ renewsAt?: number; cancelsAt?: number; status?: string } | null> {
+  const key = createHash('sha256').update(`${sessionKey}:${orgUuid}`).digest('hex')
+  const hit = subCache.get(key)
+  if (!force && hit && Date.now() - hit.at < 3_600_000) return hit.data
+  // A failed read is left uncached, so a session that comes back healthy shows a
+  // date on the next poll instead of waiting out an hour of staleness.
+  const res = await net
+    .fetch(`https://claude.ai/api/organizations/${orgUuid}/subscription_details`, {
+      headers: { Cookie: `sessionKey=${sessionKey}` }
+    })
+    .catch(() => null)
+  if (!res?.ok) return null
+  const d = (await res.json().catch(() => null)) as SubDetails | null
+  if (!d) return null
+  const ends = d.plan_ending_at ? Date.parse(d.plan_ending_at) : NaN
+  const charge = d.next_charge_at ? Date.parse(d.next_charge_at) : NaN
+  const data = {
+    // A pending cancellation ends access on plan_ending_at and takes no next charge.
+    cancelsAt: Number.isFinite(ends) ? ends : undefined,
+    renewsAt: Number.isFinite(ends) ? undefined : Number.isFinite(charge) ? charge : undefined,
+    status: typeof d.status === 'string' ? d.status : undefined
   }
-  let next = clampTo(d.getFullYear(), d.getMonth())
-  if (next.getTime() <= now) next = clampTo(d.getFullYear(), d.getMonth() + 1)
-  return { renewsAt: next.getTime(), anchorDay }
+  subCache.set(key, { at: Date.now(), data })
+  return data
 }
 
 interface Profile {
@@ -235,24 +263,35 @@ async function fetchProfile(accessToken: string, force?: boolean): Promise<Profi
 }
 
 /** Plan, price and renewal for a token's account. */
-export async function planForToken(accessToken: string, force?: boolean): Promise<PlanInfo | null> {
+export async function planForToken(
+  accessToken: string,
+  force?: boolean,
+  appSession?: PlainCookie[] | null
+): Promise<PlanInfo | null> {
   const org = (await fetchProfile(accessToken, force))?.organization
   if (!org) return null
   const tier = String(org.rate_limit_tier ?? org.organization_type ?? '')
   const priced = PLAN_PRICES.find((p) => p.match.test(tier))
-  const status = typeof org.subscription_status === 'string' ? org.subscription_status : undefined
-  const renewal =
-    typeof org.subscription_created_at === 'string'
-      ? nextRenewal(org.subscription_created_at, Date.now())
+  const oauthStatus =
+    typeof org.subscription_status === 'string' ? org.subscription_status : undefined
+
+  // The real billing date lives only on claude.ai, behind the account's web
+  // session. Without one we show the plan and its price but no renewal date —
+  // better a missing date than a projected one that a plan upgrade silently
+  // breaks (invariant: never show a billing date we cannot confirm).
+  const sessionKey = appSession?.find((c) => c.name === 'sessionKey')?.value
+  const orgUuid = typeof org.uuid === 'string' ? org.uuid : undefined
+  const verified =
+    sessionKey && orgUuid
+      ? await verifiedSubscription(sessionKey, orgUuid, force).catch(() => null)
       : null
+
   return {
     name: priced?.name ?? (tier.replace(/^default_claude_/, '').replace(/_/g, ' ') || 'Unknown plan'),
     monthlyUsd: priced?.monthlyUsd,
-    // The renewal date is computed from the billing anchor, not reported by the
-    // API — on a subscription that is not renewing it would be an invention.
-    renewsAt: status === 'active' ? renewal?.renewsAt : undefined,
-    anchorDay: status === 'active' ? renewal?.anchorDay : undefined,
-    status
+    renewsAt: verified?.renewsAt,
+    cancelsAt: verified?.cancelsAt,
+    status: verified?.status ?? oauthStatus
   }
 }
 
@@ -487,6 +526,25 @@ export const claude: Adapter = {
     }
   },
 
+  /** Snapshot order for one account: the token's own expiry. Newer token, later expiry. */
+  freshness(blob: string) {
+    try {
+      const exp = parseTokens(blob).tokens.expiresAt
+      return typeof exp === 'number' ? exp : null
+    } catch {
+      return null
+    }
+  },
+
+  async liveCredentialExpired() {
+    try {
+      const exp = JSON.parse((await liveKeychain()) ?? '')?.claudeAiOauth?.expiresAt
+      return typeof exp === 'number' && Date.now() > exp
+    } catch {
+      return false
+    }
+  },
+
   async capture(extra: ExtraPath): Promise<Captured> {
     const keychain = await readPassword(KEYCHAIN_SERVICE)
     const tokens = JSON.parse(keychain)?.claudeAiOauth
@@ -682,11 +740,40 @@ export const claude: Adapter = {
     // and adopt it back; the caller already proved the live account is this
     // profile's before setting isActive. Rate limits are bucketed per token,
     // so polling with a dead snapshot can 429 while the real login is healthy.
+    // The web session gives the real renewal date; grab it before the active
+    // account's adoption below rewrites the blob without it.
+    const appSession = ((): PlainCookie[] | null => {
+      try {
+        return (JSON.parse(blob).appSession as PlainCookie[] | null) ?? null
+      } catch {
+        return null
+      }
+    })()
     let adopted: string | undefined
     if (isActive) {
       const live = await liveKeychain()
-      if (live && live !== parseTokens(blob).keychain) {
-        adopted = JSON.stringify({ keychain: live, oauthAccount: JSON.parse(blob).oauthAccount })
+      const stored = parseTokens(blob)
+      // Adopt only a live token at least as fresh as the stored one. After a
+      // re-sign-in the vault holds the NEW grant while the Keychain still holds
+      // the dead one — adopting backwards would clobber the repair, and the
+      // dead-token branch below would then persist the clobber.
+      const liveExp = ((): unknown => {
+        try {
+          return JSON.parse(live ?? '')?.claudeAiOauth?.expiresAt
+        } catch {
+          return undefined
+        }
+      })()
+      const olderThanStored =
+        typeof liveExp === 'number' &&
+        typeof stored.tokens.expiresAt === 'number' &&
+        liveExp < stored.tokens.expiresAt
+      if (live && live !== stored.keychain && !olderThanStored) {
+        adopted = JSON.stringify({
+          keychain: live,
+          oauthAccount: JSON.parse(blob).oauthAccount,
+          ...(appSession ? { appSession } : {})
+        })
         blob = adopted
       }
     }
@@ -707,27 +794,50 @@ export const claude: Adapter = {
     // only on the token, so an account whose usage call fails should still show
     // what it costs. Computing it on the success path alone left every account
     // but the one being polled without a plan line.
-    const plan = (await planForToken(tokens.accessToken, force).catch(() => null)) ?? undefined
+    const plan =
+      (await planForToken(tokens.accessToken, force, appSession).catch(() => null)) ?? undefined
 
+    // A dead token doesn't always answer 401/403 — Anthropic's gateway returns
+    // 429 for one too, which read as "rate limited" when it was really expired.
+    // The honest discriminator is the token's own clock: a genuine throttle only
+    // happens on a live token, so a 429 past expiry is a dead token, not a limit.
+    const expiredNow = typeof tokens.expiresAt === 'number' && Date.now() > tokens.expiresAt
     let result = await fetchUsageWindows(tokens.accessToken)
-    if (!Array.isArray(result) && (result.status === 401 || result.status === 403)) {
-      if (isActive) return { plan, windows: [], note: 'session expired', updatedBlob: adopted }
+    const authFail = !Array.isArray(result) && (result.status === 401 || result.status === 403)
+    const deadToken = authFail || (!Array.isArray(result) && result.status === 429 && expiredNow)
+    if (deadToken) {
+      // The CLI owns the active account's token and renews it itself; refreshing
+      // here with a superseded refresh token surfaces as "OAuth revoked"
+      // (invariant 16). So the active account only reports — it never refreshes.
+      if (isActive) return { plan, windows: [], expired: true, updatedBlob: adopted }
       const refreshed = await refreshTokens(tokens)
-      if (!refreshed) {
-        return {
-          plan,
-          windows: [],
-          note: 'session expired. Add the account again'
-        }
-      }
+      if (!refreshed) return { plan, windows: [], expired: true }
+      // Keep the app-session half: dropping it here stripped the claude.ai
+      // cookies from the vault copy on every background refresh.
+      const refreshedBlob = JSON.stringify({
+        keychain: JSON.stringify({ claudeAiOauth: refreshed }),
+        oauthAccount,
+        ...(appSession ? { appSession } : {})
+      })
       result = await fetchUsageWindows(refreshed.accessToken as string)
       if (!Array.isArray(result)) {
-        return { plan, windows: [], note: `usage unavailable (${result.status})` }
+        if (result.status === 429)
+          return {
+            plan,
+            windows: [],
+            note: 'usage temporarily unavailable',
+            retryAfterMs: result.retryAfterMs,
+            updatedBlob: refreshedBlob
+          }
+        return { plan, windows: [], note: `usage unavailable (${result.status})`, updatedBlob: refreshedBlob }
       }
       return {
-        plan: (await planForToken(refreshed.accessToken as string).catch(() => null)) ?? plan,
+        plan:
+          (await planForToken(refreshed.accessToken as string, force, appSession).catch(
+            () => null
+          )) ?? plan,
         windows: result,
-        updatedBlob: JSON.stringify({ keychain: JSON.stringify({ claudeAiOauth: refreshed }), oauthAccount })
+        updatedBlob: refreshedBlob
       }
     }
     if (!Array.isArray(result)) {

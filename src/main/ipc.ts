@@ -30,30 +30,51 @@ const asResult = async (fn: () => Promise<ActionResult>): Promise<ActionResult> 
  * Sign in and store the new account WITHOUT making it live. Adding is a
  * library action; switching stays an explicit, separate choice.
  */
-async function loginStart(serviceId: ServiceId): Promise<ActionResult> {
+async function loginStart(serviceId: ServiceId, loginHint?: string): Promise<ActionResult> {
   switch (serviceId) {
     case 'claude-code': {
       // One window: signing in gives us the app session, approving gives us the
-      // CLI tokens. Both halves, no code to paste.
-      const captured = await login.claudeSignIn()
+      // CLI tokens. Both halves, no code to paste. A hint pre-fills the address
+      // when an expired account signs itself back in.
+      const captured = await login.claudeSignIn(loginHint)
       if (!captured) return { ok: false, error: 'sign-in cancelled' }
       const already = vault.profiles(serviceId).find((p) => p.accountId === captured.accountId)
       // A full sign-in always carries credentials, so this never skips.
       const name = accounts.saveCaptured(serviceId, captured) ?? undefined
-      accounts.clearUsageCache(serviceId)
-      return {
-        ok: true,
-        name,
-        notes: [
-          captured.note ?? '',
-          already ? 'this account was already saved, so it was refreshed' : ''
-        ].filter(Boolean)
+      // A token can be revoked ahead of its recorded expiry, where only the
+      // failed poll knows the sign-in is dead — read that flag before the
+      // cache clear strips it.
+      const wasExpired = name ? accounts.reportedExpired(serviceId, name) : false
+      accounts.clearUsageCache(serviceId, name)
+      const notes = [
+        captured.note ?? '',
+        already ? 'this account was already saved, so it was refreshed' : ''
+      ].filter(Boolean)
+      // Re-signing the account the CLI is already on, while its sign-in is dead
+      // (token past expiry, or revoked early per the last poll): install the
+      // fresh credentials too. The account does not change, so this is a
+      // repair, not a switch (invariant 6) — and without it the new tokens are
+      // stranded, because the active row offers no Switch button.
+      const a = adapter(serviceId)
+      const liveId = await a.liveAccountId().catch(() => null)
+      if (
+        name &&
+        liveId === captured.accountId &&
+        (wasExpired || (await a.liveCredentialExpired?.().catch(() => false)))
+      ) {
+        const repaired = await accounts.activate(serviceId, name)
+        notes.push(
+          repaired.ok
+            ? 'CLI sign-in repaired'
+            : `saved, but the CLI still holds a dead sign-in (${repaired.error})`
+        )
       }
+      return { ok: true, name, notes }
     }
     case 'cursor': {
       const captured = await login.cursorLogin()
       const name = accounts.saveCaptured(serviceId, captured) ?? undefined
-      accounts.clearUsageCache(serviceId)
+      accounts.clearUsageCache(serviceId, name)
       return { ok: true, name }
     }
     case 'codex': {
@@ -148,7 +169,9 @@ export function registerIpc(): void {
     applyWindowMode(mode)
     return { ok: true }
   })
-  ipcMain.handle('login:start', (_e, serviceId: ServiceId) => asResult(() => loginStart(serviceId)))
+  ipcMain.handle('login:start', (_e, serviceId: ServiceId, loginHint?: string) =>
+    asResult(() => loginStart(serviceId, loginHint))
+  )
   ipcMain.handle('login:cancel', (_e, serviceId: ServiceId) => loginCancel(serviceId))
 
   ipcMain.handle('proxy:status', async () => ({

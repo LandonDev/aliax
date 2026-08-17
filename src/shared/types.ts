@@ -130,6 +130,8 @@ export interface UsageReport {
    * good ones; `until` is when the limit lifts, if the provider told us.
    */
   rateLimit?: { provider: string; until?: number }
+  /** The sign-in has expired; the row offers a one-click same-email re-login. */
+  expired?: boolean
 }
 
 export type ActionResult = { ok: true; name?: string; notes?: string[] } | { ok: false; error: string }

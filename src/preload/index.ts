@@ -24,8 +24,8 @@ const api = {
     ipcRenderer.invoke('profiles:delete', serviceId, name),
   usage: (serviceId: ServiceId, force?: boolean): Promise<UsageReport[]> =>
     ipcRenderer.invoke('usage:get', serviceId, force),
-  loginStart: (serviceId: ServiceId): Promise<ActionResult> =>
-    ipcRenderer.invoke('login:start', serviceId),
+  loginStart: (serviceId: ServiceId, loginHint?: string): Promise<ActionResult> =>
+    ipcRenderer.invoke('login:start', serviceId, loginHint),
   loginCancel: (serviceId: ServiceId): Promise<void> =>
     ipcRenderer.invoke('login:cancel', serviceId),
   updateProfile: (

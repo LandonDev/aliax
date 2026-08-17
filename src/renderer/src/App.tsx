@@ -197,10 +197,14 @@ export default function App() {
   const onUse = (serviceId: ServiceId, name: string) =>
     run(`use:${serviceId}:${name}`, () => window.aliax.activate(serviceId, name), 'Switched')
 
-  /** Adding never switches. Offer the switch as the next step instead. */
-  const addAccount = async (serviceId: ServiceId) => {
+  /**
+   * Adding never switches. Offer the switch as the next step instead. A hint
+   * pre-fills the address so an expired account signs itself back in with one
+   * click; re-signing the same email refreshes the existing row in place.
+   */
+  const addAccount = async (serviceId: ServiceId, loginHint?: string) => {
     setLoginService(serviceId)
-    const result = await window.aliax.loginStart(serviceId)
+    const result = await window.aliax.loginStart(serviceId, loginHint)
     setLoginService(null)
     if (!result.ok) {
       toast.error(result.error ?? 'Sign-in failed')
@@ -324,6 +328,7 @@ export default function App() {
                 busy={busy}
                 onCapture={(id) => run(`capture:${id}`, () => window.aliax.capture(id), 'Saved')}
                 onAdd={addAccount}
+                onReauth={(id, email) => addAccount(id, email)}
                 onUse={onUse}
                 onDelete={(id, name) =>
                   run(`use:${id}:${name}`, () => window.aliax.remove(id, name), 'Removed')

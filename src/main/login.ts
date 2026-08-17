@@ -34,8 +34,8 @@ export const CLAUDE_TOKEN_URL = 'https://api.anthropic.com/v1/oauth/token'
  *
  * Returns null when the user closes the window without approving.
  */
-export async function claudeSignIn(): Promise<Captured | null> {
-  const result = await claudeWebLogin()
+export async function claudeSignIn(loginHint?: string): Promise<Captured | null> {
+  const result = await claudeWebLogin(loginHint)
   if (!result) return null
 
   const res = await net.fetch(CLAUDE_TOKEN_URL, {

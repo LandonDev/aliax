@@ -52,7 +52,7 @@ export interface WebLoginResult {
  * cookies) and approving redirects with the authorization code (giving us the
  * CLI tokens). No second browser trip and nothing to paste.
  */
-export async function claudeWebLogin(): Promise<WebLoginResult | null> {
+export async function claudeWebLogin(loginHint?: string): Promise<WebLoginResult | null> {
   const verifier = randomBytes(32).toString('base64url')
   const challenge = createHash('sha256').update(verifier).digest('base64url')
 
@@ -65,6 +65,9 @@ export async function claudeWebLogin(): Promise<WebLoginResult | null> {
   url.searchParams.set('code_challenge', challenge)
   url.searchParams.set('code_challenge_method', 'S256')
   url.searchParams.set('state', verifier)
+  // Re-signing an expired account: pre-fill the address so the consent page and
+  // Google's chooser land on the right login instead of asking who you are.
+  if (loginHint) url.searchParams.set('login_hint', loginHint)
 
   const ses = session.fromPartition(LOGIN_PARTITION)
   ses.setUserAgent(BROWSER_UA)

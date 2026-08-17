@@ -59,6 +59,30 @@ async function activeProfileName(a: Adapter): Promise<string | null> {
 }
 
 /**
+ * A snapshot may be stale, but it must never go BACKWARDS: capturing a dead
+ * live token over a freshly re-signed vault copy is how a re-add silently
+ * undid itself. Adapters that can order two snapshots of the same account
+ * (Claude, via the token's own expiry) declare `freshness`; without it the
+ * live copy always wins — correct for Codex, whose rotating refresh token
+ * makes the on-disk file the one rightful newest (invariant 18).
+ */
+function saveSecretUnlessOlder(a: Adapter, name: string, blob: string): boolean {
+  if (a.freshness) {
+    let prior: string | null = null
+    try {
+      prior = vault.readSecret(a.id, name)
+    } catch {
+      // undecryptable stored copy: the incoming one can only improve things
+    }
+    const priorAt = prior ? a.freshness(prior) : null
+    const nextAt = a.freshness(blob)
+    if (priorAt !== null && nextAt !== null && nextAt < priorAt) return false
+  }
+  vault.saveSecret(a.id, name, blob)
+  return true
+}
+
+/**
  * Save the live credentials into the matching stored profile, so tokens the tool
  * refreshed since the last capture are not lost on switch. Skips when the live
  * account cannot be matched confidently — never risks writing one account's
@@ -70,7 +94,7 @@ export async function recaptureLive(a: Adapter): Promise<void> {
   if (existing) {
     const captured = await a.capture(extra(a.id, existing.name))
     if (captured.accountId === existing.accountId && captured.blob !== undefined) {
-      vault.saveSecret(a.id, existing.name, captured.blob)
+      saveSecretUnlessOlder(a, existing.name, captured.blob)
       vault.upsertProfile(a.id, { ...existing, email: captured.email ?? existing.email })
     }
   }
@@ -104,7 +128,7 @@ export function saveCaptured(serviceId: ServiceId, captured: Captured): string |
   const name = match?.name ?? captured.email ?? `account-${existing.length + 1}`
 
   if (captured.blob !== undefined) {
-    vault.saveSecret(serviceId, name, captured.blob)
+    saveSecretUnlessOlder(adapter(serviceId), name, captured.blob)
   } else if (captured.appSession !== undefined) {
     // App-session-only save: merge into any existing credentials for this account
     // rather than replacing them, so a profile accumulates both halves.
@@ -374,10 +398,32 @@ const usageCachePath = (): string => join(app.getPath('userData'), 'usage-cache.
  * switch or a save has to re-read usage, but deleting the entry left a
  * rate-limited account with nothing to fall back on — which is how a row that
  * had shown real percentages a second earlier came back as a bare dash.
+ *
+ * `freshlySigned` names a profile whose credentials a real sign-in just
+ * replaced. Rate limits are bucketed per token, so a window recorded against
+ * the old token means nothing to the new one — and the gate in usage() runs
+ * before staleness, so leaving it would block the fresh token for the rest of
+ * the countdown. That gate is why remove-and-re-add never recovered a row.
  */
-export function clearUsageCache(serviceId: ServiceId): void {
+/**
+ * Whether the last poll flagged this profile's sign-in as dead. Read it BEFORE
+ * clearUsageCache strips the flag: it is what tells a same-account re-sign-in
+ * to repair the CLI when the token was revoked ahead of its recorded expiry,
+ * where the local clock says nothing is wrong.
+ */
+export function reportedExpired(serviceId: ServiceId, name: string): boolean {
+  return cache().get(`${serviceId}:${name}`)?.report.expired === true
+}
+
+export function clearUsageCache(serviceId: ServiceId, freshlySigned?: string): void {
   for (const [key, entry] of cache()) {
-    if (key.startsWith(`${serviceId}:`)) cache().set(key, { ...entry, stale: true })
+    if (!key.startsWith(`${serviceId}:`)) continue
+    const fresh = freshlySigned !== undefined && key === `${serviceId}:${freshlySigned}`
+    cache().set(key, {
+      ...entry,
+      stale: true,
+      report: fresh ? { ...entry.report, rateLimit: undefined, expired: undefined } : entry.report
+    })
   }
   persistCache()
 }
@@ -448,6 +494,25 @@ export async function usage(serviceId: ServiceId, force = false): Promise<UsageR
       try {
         const result = await a.usage(blob, p.name === active, force)
         if (result.updatedBlob) vault.saveSecret(serviceId, p.name, result.updatedBlob)
+
+        // The sign-in is dead: keep the last good windows, flag it so the row
+        // offers a same-email re-login, and clear any stale rate-limit line.
+        if (result.expired) {
+          const base = cached?.report.windows.length
+            ? cached.report
+            : { profileName: p.name, windows: [] as UsageWindow[] }
+          const merged: UsageReport = {
+            ...base,
+            profileName: p.name,
+            note: undefined,
+            plan: result.plan ?? base.plan,
+            rateLimit: undefined,
+            expired: true
+          }
+          cache().set(key, { at: now, report: merged })
+          persistCache()
+          return merged
+        }
 
         // Rate limited: keep the last good windows, flag the limit on top. The
         // countdown comes from Retry-After when the provider sends one; without

@@ -26,6 +26,8 @@ export interface UsageResult {
   updatedBlob?: string
   /** On a 429, ms until the provider will accept calls again (from Retry-After). */
   retryAfterMs?: number
+  /** The sign-in is dead and no refresh can revive it — the account must sign in again. */
+  expired?: boolean
 }
 
 /** Parse a Retry-After header (delta-seconds or HTTP date) into ms from now. */
@@ -76,6 +78,15 @@ export interface Adapter {
   fingerprintOf?(blob: string): string | null
   /** Who a stored blob really belongs to, used to repair mislabeled profiles. */
   identify?(blob: string): Promise<{ accountId: string; email?: string } | null>
+  /**
+   * Orders two credential snapshots of the SAME account (higher = newer), so a
+   * save can refuse to go backwards. Claude uses the token's own expiry. Leave
+   * absent when the live copy must always win (Codex: the rotating refresh
+   * token makes the newest generation the only valid one, invariant 18).
+   */
+  freshness?(blob: string): number | null
+  /** Whether the live credentials sit past their own expiry. Local and cheap. */
+  liveCredentialExpired?(): Promise<boolean>
   /**
    * The account signed into each place this service reaches, keyed by a short label.
    * A service can span independent logins (a CLI token and a desktop app's web session),

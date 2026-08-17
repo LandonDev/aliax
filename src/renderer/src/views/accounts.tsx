@@ -4,6 +4,7 @@ import {
   Clock,
   CreditCard,
   Download,
+  LogIn,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -198,6 +199,28 @@ function RateLimitLine({ rl, now }: { rl: NonNullable<UsageReport['rateLimit']>;
       <Clock className="size-3 shrink-0" />
       {rateLimitLabel(rl, now)}
     </span>
+  )
+}
+
+/**
+ * The sign-in has expired. One click re-signs the same address — the whole line
+ * is the button, so there's nothing to hunt for and nothing to read twice.
+ */
+function ExpiredLine({ onReauth }: { onReauth: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation()
+        onReauth()
+      }}
+      className="flex items-center gap-1.5 text-[11px] text-warning transition-colors hover:text-warning/80"
+    >
+      <LogIn className="size-3 shrink-0" />
+      <span>
+        Session expired · <span className="underline underline-offset-2">Sign in</span>
+      </span>
+    </button>
   )
 }
 
@@ -402,6 +425,7 @@ function ProfileRow({
   slots,
   billingUrl,
   onUse,
+  onReauth,
   onDelete,
   onEdited
 }: {
@@ -414,6 +438,7 @@ function ProfileRow({
   slots: number
   billingUrl?: string
   onUse: () => void
+  onReauth: () => void
   onDelete: () => void
   onEdited: () => void
 }) {
@@ -505,7 +530,11 @@ function ProfileRow({
         </DropdownMenu>
         </div>
         {report?.plan && <PlanLine plan={report.plan} now={now} />}
-        {report?.rateLimit && <RateLimitLine rl={report.rateLimit} now={now} />}
+        {report?.expired ? (
+          <ExpiredLine onReauth={onReauth} />
+        ) : (
+          report?.rateLimit && <RateLimitLine rl={report.rateLimit} now={now} />
+        )}
       </div>
 
       <BankedResets count={report?.banked} />
@@ -533,6 +562,7 @@ function ServicePanel({
   onCapture,
   onAdd,
   onUse,
+  onReauth,
   onDelete,
   onRefresh
 }: {
@@ -543,6 +573,7 @@ function ServicePanel({
   onCapture: () => void
   onAdd: () => void
   onUse: (name: string) => void
+  onReauth: (name: string, email?: string) => void
   onDelete: (name: string) => void
   onRefresh: () => void
 }) {
@@ -612,6 +643,7 @@ function ServicePanel({
               report={usage?.find((r) => r.profileName === p.name)}
               busy={busy === `use:${p.name}`}
               onUse={() => onUse(p.name)}
+              onReauth={() => onReauth(p.name, p.email)}
               onDelete={() => onDelete(p.name)}
               onEdited={onRefresh}
             />
@@ -656,6 +688,7 @@ export function AccountsView({
   busy,
   onCapture,
   onAdd,
+  onReauth,
   onUse,
   onDelete,
   onRefresh
@@ -665,6 +698,7 @@ export function AccountsView({
   busy: string | null
   onCapture: (serviceId: ServiceId) => void
   onAdd: (serviceId: ServiceId) => void
+  onReauth: (serviceId: ServiceId, email?: string) => void
   onUse: (serviceId: ServiceId, name: string) => void
   onDelete: (serviceId: ServiceId, name: string) => void
   onRefresh: () => void
@@ -688,6 +722,7 @@ export function AccountsView({
           onCapture={() => onCapture(s.id)}
           onAdd={() => onAdd(s.id)}
           onUse={(name) => onUse(s.id, name)}
+          onReauth={(_name, email) => onReauth(s.id, email)}
           onDelete={(name) => onDelete(s.id, name)}
           onRefresh={onRefresh}
         />
