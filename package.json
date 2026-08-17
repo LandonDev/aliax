@@ -1,6 +1,6 @@
 {
   "name": "aliax",
-  "version": "0.1.14",
+  "version": "0.1.16",
   "description": "Manage accounts, usage limits, and stats across AI coding tools",
   "main": "out/main/index.js",
   "private": true,
