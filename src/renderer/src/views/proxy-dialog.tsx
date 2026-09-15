@@ -249,7 +249,11 @@ export function ProxyDialog({
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Gateway</span>
                     <span className={proxy?.running ? 'text-success' : 'text-destructive'}>
-                      {proxy?.running ? `running on port ${proxy.port}` : 'stopped'}
+                      {!proxy?.running
+                        ? 'stopped'
+                        : proxy.standby
+                          ? `standing by · ${proxy.standby} routes for now`
+                          : `running on port ${proxy.port}`}
                     </span>
                   </div>
                   <div className="flex justify-between">

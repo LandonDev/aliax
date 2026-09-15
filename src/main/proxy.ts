@@ -8,12 +8,14 @@ import {
   pinnedProfile,
   readMarker,
   release,
+  watchMarker,
   type Owner,
   type ProxyStatus,
   type Role
 } from 'aliax-core'
 
 export { pinProfile, RUNTIME_DIR } from 'aliax-core'
+import { broadcast } from './events'
 
 /**
  * A localhost gateway that swaps the Authorization header on every CLI request
@@ -33,6 +35,7 @@ let server: Server | null = null
 let port = 0
 let lastError: string | null = null
 let standby: Owner | null = null
+let stopWatching: (() => void) | null = null
 const routed: Record<string, number> = {}
 
 /** Standby only reads the shared cache and never refreshes stored tokens. */
@@ -51,13 +54,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 export function claimIfFree(): boolean {
   if (!server) return false
   const current = readMarker()
+  const was = standby
   if (isLive(current) && current.owner !== OWNER && current.pid !== process.pid) {
     standby = current.owner
-    return false
+  } else {
+    standby = null
+    // Our own live marker needs no rewrite; that would only wake other watchers.
+    if (current?.pid !== process.pid || current.port !== port) claim(OWNER, port)
   }
-  standby = null
-  claim(OWNER, port)
-  return true
+  // The window shows who routes, and the tray's numbers come from a cache the
+  // owner writes, so a flip either way is worth a redraw.
+  if (was !== standby) broadcast('accounts:changed')
+  return standby === null
 }
 
 export async function startProxy(): Promise<ProxyStatus> {
@@ -87,10 +95,14 @@ export async function startProxy(): Promise<ProxyStatus> {
   const address = server.address()
   port = typeof address === 'object' && address ? address.port : 0
   claimIfFree()
+  // Rule 4: notice a foreign owner arriving or leaving, and a dead one on the tick.
+  stopWatching = watchMarker(() => claimIfFree())
   return status()
 }
 
 export async function stopProxy(): Promise<ProxyStatus> {
+  stopWatching?.()
+  stopWatching = null
   clearRuntimeFile()
   const current = server
   server = null

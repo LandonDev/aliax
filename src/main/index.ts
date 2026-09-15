@@ -1,12 +1,13 @@
 import { app, BrowserWindow, net, safeStorage, shell } from 'electron'
 import { join } from 'node:path'
-import { configure, getSettings, saveSettings } from 'aliax-core'
+import { statSync, watch } from 'node:fs'
+import { accounts, configure, getSettings, saveSettings } from 'aliax-core'
 import { registerIpc } from './ipc'
 import { clearRuntimeFile, role, startProxy, stopProxy } from './proxy'
 import { resumePendingRemoval } from './shim'
 import { broadcast, setBroadcast } from './events'
 import { recordAppEvent, recordUsage } from './stats/store'
-import { createTray } from './tray'
+import { createTray, refreshTray } from './tray'
 import { startUpdater } from './updater'
 import type { WindowMode } from '../shared/types'
 
@@ -68,6 +69,44 @@ function createWindow(): void {
   }
 }
 
+/**
+ * temp-code shares the vault, the pin and the usage cache in userData. One
+ * watch on the directory notices its writes; our own writes already redraw
+ * through the core's hook, so only a pin we did not set or a cache we did not
+ * write gets a broadcast.
+ */
+function watchDataDir(): void {
+  const dir = app.getPath('userData')
+  let pins = JSON.stringify(getSettings().proxyAccounts ?? {})
+  let timer: NodeJS.Timeout | null = null
+  const check = (): void => {
+    timer = null
+    const nowPins = JSON.stringify(getSettings().proxyAccounts ?? {})
+    const pinMoved = nowPins !== pins
+    pins = nowPins
+    let cacheMtime = 0
+    try {
+      cacheMtime = statSync(join(dir, 'usage-cache.json')).mtimeMs
+    } catch {
+      // no cache yet
+    }
+    const cacheMoved = cacheMtime !== 0 && cacheMtime !== accounts.cacheMtimeSeen()
+    if (!pinMoved && !cacheMoved) return
+    broadcast('accounts:changed')
+    refreshTray()
+  }
+  try {
+    const watcher = watch(dir, (_event, file) => {
+      if (file !== 'settings.json' && file !== 'usage-cache.json') return
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(check, 200)
+    })
+    watcher.on('error', () => {})
+  } catch {
+    // without a watcher the 60 s tray refresh still catches up
+  }
+}
+
 // Do NOT app.setName here: safeStorage keys the Keychain item by app name
 // ("<name> Safe Storage"), so a runtime rename orphans every stored secret.
 // The packaged app takes its name from productName instead.
@@ -104,6 +143,7 @@ app.whenReady().then(() => {
   startUpdater()
   resumePendingRemoval().catch(() => {})
   if (getSettings().proxyEnabled) startProxy().catch(() => {})
+  watchDataDir()
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()

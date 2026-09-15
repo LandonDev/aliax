@@ -61,11 +61,13 @@ export function ProxyBar({
           </span>
         </div>
         <div className="truncate text-xs text-muted-foreground">
-          {on
-            ? routed > 0
-              ? `Switching accounts takes effect without restarting sessions · ${routed} requests routed`
-              : 'Switching accounts takes effect without restarting sessions'
-            : 'Switching accounts restarts your terminal sessions'}
+          {!on
+            ? 'Switching accounts restarts your terminal sessions'
+            : proxy?.standby
+              ? `Routing through ${proxy.standby}`
+              : routed > 0
+                ? `Switching accounts takes effect without restarting sessions · ${routed} requests routed`
+                : 'Switching accounts takes effect without restarting sessions'}
         </div>
       </div>
 
