@@ -5,8 +5,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import type { ShimStatus } from '../shared/types'
-import { processCommand, processEnv } from './procs'
-import { RUNTIME_DIR } from './proxy'
+import { processCommand, processEnv, RUNTIME_DIR } from 'aliax-core'
 
 const exec = promisify(execFile)
 

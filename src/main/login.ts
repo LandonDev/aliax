@@ -3,8 +3,7 @@ import { claudeWebLogin } from './claude-web-login'
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { promisify } from 'node:util'
-import type { Captured } from './adapters/types'
-import { decodeJwtPayload } from './adapters/types'
+import { CLAUDE_CLIENT_ID, CLAUDE_TOKEN_URL, decodeJwtPayload, type Captured } from 'aliax-core'
 
 const exec = promisify(execFile)
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -15,11 +14,6 @@ function pkce(): { verifier: string; challenge: string } {
 }
 
 // ---- Claude: Claude Code's own public OAuth client, manual-code variant ----
-
-export const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
-/** The console host proxies this endpoint but rate-limits hard; the api host does not. */
-export const CLAUDE_TOKEN_URL = 'https://api.anthropic.com/v1/oauth/token'
-
 
 /**
  * The whole Claude sign-in: one window, both halves, nothing to paste.

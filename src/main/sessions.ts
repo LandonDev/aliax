@@ -10,7 +10,7 @@ import {
   routedThroughAliax,
   terminalOwns,
   type CliProcess
-} from './procs'
+} from 'aliax-core'
 import { status as proxyStatus } from './proxy'
 import { SHIM_PORT } from './shim'
 

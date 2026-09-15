@@ -1,8 +1,7 @@
 import { BrowserWindow, session } from 'electron'
 import { createHash, randomBytes } from 'node:crypto'
-import type { PlainCookie } from './chromium-cookies'
+import { CLAUDE_CLIENT_ID, type PlainCookie } from 'aliax-core'
 
-export const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 /**
  * Anthropic moved this page from console.anthropic.com to platform.claude.com;
  * the old host no longer appears in Claude Code's CLI at all. Keep it in step

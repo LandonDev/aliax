@@ -1,10 +1,11 @@
-import { app, BrowserWindow, shell } from 'electron'
+import { app, BrowserWindow, net, safeStorage, shell } from 'electron'
 import { join } from 'node:path'
+import { configure, getSettings, saveSettings } from 'aliax-core'
 import { registerIpc } from './ipc'
-import { clearRuntimeFile, startProxy, stopProxy } from './proxy'
+import { clearRuntimeFile, role, startProxy, stopProxy } from './proxy'
 import { resumePendingRemoval } from './shim'
-import { setBroadcast } from './events'
-import { getSettings, saveSettings } from './settings'
+import { broadcast, setBroadcast } from './events'
+import { recordAppEvent, recordUsage } from './stats/store'
 import { createTray } from './tray'
 import { startUpdater } from './updater'
 import type { WindowMode } from '../shared/types'
@@ -72,6 +73,25 @@ function createWindow(): void {
 // The packaged app takes its name from productName instead.
 
 app.whenReady().then(() => {
+  // Everything in aliax-core reads the vault, settings and usage cache through
+  // this: Aliax keeps its own safeStorage key and name, so nothing on disk moves.
+  configure({
+    dataDir: app.getPath('userData'),
+    fetch: (input, init) => net.fetch(input, init),
+    secrets: {
+      mode: 'safeStorage',
+      encrypt: (plain) => safeStorage.encryptString(plain),
+      decrypt: (blob) => safeStorage.decryptString(blob)
+    },
+    appName: app.getName(),
+    hooks: {
+      onUsageSample: (s) =>
+        recordUsage(s.service, s.account, s.label, s.usedPercent, s.resetsAt, s.periodMs),
+      onAppEvent: recordAppEvent,
+      onAccountsChanged: () => broadcast('accounts:changed')
+    },
+    role
+  })
   // Packaged builds get the icon and name from the bundle; dev runs need both
   // set at runtime or the dock shows Electron.
   if (!app.isPackaged && process.platform === 'darwin') {

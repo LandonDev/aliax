@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { ShellIntegration } from '../shared/types'
-import { RUNTIME_DIR } from './proxy'
+import { RUNTIME_DIR } from 'aliax-core'
 
 const SNIPPET_PATH = join(RUNTIME_DIR, 'shell.sh')
 const BEGIN = '# >>> aliax >>>'

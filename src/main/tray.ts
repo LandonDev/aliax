@@ -2,9 +2,8 @@ import { app, Menu, nativeImage, Notification, Tray } from 'electron'
 import { join } from 'node:path'
 import type { ServiceId, UsageReport, UsageWindow } from '../shared/types'
 import { healthOf, onPaceLeft, percentLeft, type Health } from '../shared/health'
-import * as accounts from './accounts'
+import { accounts, getSettings, saveSettings } from 'aliax-core'
 import { broadcast } from './events'
-import { getSettings, saveSettings } from './settings'
 
 let tray: Tray | null = null
 let building = false
