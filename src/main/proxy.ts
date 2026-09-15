@@ -48,14 +48,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 }
 
 /**
- * Take the marker unless a live foreign gateway holds it. Returns whether we
- * own the shim now. Safe to call again whenever the marker changes.
+ * Take the marker unless a live gateway holds it. A foreign owner always keeps
+ * it (rule 1). Another copy of Aliax keeps it too, except at startup: a fresh
+ * copy takes over, so a dev run beside the installed app gets the shim and
+ * hands it back on quit. Without that, two copies would reclaim in turns
+ * forever. Returns whether we own the shim now.
  */
-export function claimIfFree(): boolean {
+export function claimIfFree(takeOver = false): boolean {
   if (!server) return false
   const current = readMarker()
   const was = standby
-  if (isLive(current) && current.owner !== OWNER && current.pid !== process.pid) {
+  if (isLive(current) && current.pid !== process.pid && (current.owner !== OWNER || !takeOver)) {
     standby = current.owner
   } else {
     standby = null
@@ -94,7 +97,7 @@ export async function startProxy(): Promise<ProxyStatus> {
 
   const address = server.address()
   port = typeof address === 'object' && address ? address.port : 0
-  claimIfFree()
+  claimIfFree(true)
   // Rule 4: notice a foreign owner arriving or leaving, and a dead one on the tick.
   stopWatching = watchMarker(() => claimIfFree())
   return status()

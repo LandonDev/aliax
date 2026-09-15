@@ -171,9 +171,13 @@ export default function App() {
     const interval = setInterval(() => refresh(), 5 * 60_000)
     const onFocus = () => refresh()
     window.addEventListener('focus', onFocus)
-    // A switch made from the menu bar has to show up here immediately, not on
-    // the next poll — otherwise it reads as if the switch never happened.
-    const unsubscribe = window.aliax.onAccountsChanged(() => refresh(true))
+    // A switch made from the menu bar, or a change another copy wrote to the
+    // shared files, has to show up here immediately. It reads from the cache:
+    // forcing a poll here made every cache write trigger another poll.
+    const unsubscribe = window.aliax.onAccountsChanged(() => {
+      lastRefresh.current = 0
+      void refresh()
+    })
     return () => {
       clearInterval(interval)
       window.removeEventListener('focus', onFocus)
