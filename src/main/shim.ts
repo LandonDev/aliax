@@ -18,12 +18,21 @@ const exec = promisify(execFile)
  */
 export const SHIM_PORT = 8787
 export const SHIM_URL = `http://127.0.0.1:${SHIM_PORT}`
+/** Codex 0.158+ refuses a ChatGPT base that is not HTTPS: it gets the shim's TLS port. */
+export const SHIM_TLS_PORT = 8789
+export const CODEX_SHIM_URL = `https://127.0.0.1:${SHIM_TLS_PORT}`
+/** The base Aliax wrote before the TLS port; still Aliax's own when it meets it. */
+const LEGACY_CODEX_BASE = `${SHIM_URL}/codex`
+const CODEX_BASE = `${CODEX_SHIM_URL}/codex`
 
 const LABEL = 'com.aliax.shim'
 const SCRIPT_PATH = join(RUNTIME_DIR, 'aliax-shim.mjs')
 const PLIST_PATH = join(homedir(), 'Library/LaunchAgents', `${LABEL}.plist`)
 const LOG_PATH = join(RUNTIME_DIR, 'shim.log')
 const REMOVE_PENDING_PATH = join(RUNTIME_DIR, 'shim-remove-pending')
+/** The shim's certificate; the user trusts ca.pem in Keychain once. */
+export const TLS_DIR = join(RUNTIME_DIR, 'tls')
+export const TLS_CA_PATH = join(TLS_DIR, 'ca.pem')
 let cleanupTimer: NodeJS.Timeout | null = null
 
 /**
@@ -55,7 +64,10 @@ const plist = (node: string): string => `<?xml version="1.0" encoding="UTF-8"?>
   <key>ProgramArguments</key>
   <array><string>${node}</string><string>${SCRIPT_PATH}</string></array>
   <key>EnvironmentVariables</key>
-  <dict><key>ALIAX_SHIM_PORT</key><string>${SHIM_PORT}</string></dict>
+  <dict>
+    <key>ALIAX_SHIM_PORT</key><string>${SHIM_PORT}</string>
+    <key>ALIAX_SHIM_TLS_PORT</key><string>${SHIM_TLS_PORT}</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${LOG_PATH}</string>
@@ -74,6 +86,62 @@ async function responding(): Promise<boolean> {
   }
 }
 
+const OPENSSL = ['/opt/homebrew/bin/openssl', '/usr/local/bin/openssl'].find(existsSync) ?? '/usr/bin/openssl'
+
+/**
+ * A local CA and a 127.0.0.1 certificate it signs, made once. The CA's key
+ * is deleted as soon as the leaf is signed: the CA the user trusts can
+ * never vouch for anything else. A lapsed leaf means a new pair (and a new
+ * Keychain trust).
+ */
+async function ensureCertificate(): Promise<void> {
+  const cert = join(TLS_DIR, 'cert.pem')
+  const key = join(TLS_DIR, 'key.pem')
+  if (existsSync(cert) && existsSync(key) && existsSync(TLS_CA_PATH)) {
+    const valid = await exec(OPENSSL, ['x509', '-checkend', String(7 * 86400), '-noout', '-in', cert])
+      .then(() => true)
+      .catch(() => false)
+    if (valid) return
+  }
+  rmSync(TLS_DIR, { recursive: true, force: true })
+  mkdirSync(TLS_DIR, { recursive: true, mode: 0o700 })
+  const at = (name: string): string => join(TLS_DIR, name)
+  writeFileSync(
+    at('ca.cnf'),
+    [
+      '[req]',
+      'distinguished_name = dn',
+      'prompt = no',
+      'x509_extensions = v3_ca',
+      '[dn]',
+      'CN = Aliax Local CA',
+      '[v3_ca]',
+      'basicConstraints = critical, CA:true, pathlen:0',
+      'keyUsage = critical, keyCertSign, cRLSign',
+      'subjectKeyIdentifier = hash',
+      ''
+    ].join('\n')
+  )
+  writeFileSync(
+    at('leaf.ext'),
+    [
+      'basicConstraints = critical, CA:false',
+      'keyUsage = critical, digitalSignature',
+      'extendedKeyUsage = serverAuth',
+      'subjectAltName = IP:127.0.0.1, DNS:localhost',
+      ''
+    ].join('\n')
+  )
+  const ec = ['ecparam', '-name', 'prime256v1', '-genkey', '-noout']
+  await exec(OPENSSL, [...ec, '-out', at('ca-key.pem')])
+  await exec(OPENSSL, ['req', '-x509', '-new', '-key', at('ca-key.pem'), '-out', TLS_CA_PATH, '-days', '3650', '-config', at('ca.cnf')])
+  await exec(OPENSSL, [...ec, '-out', key])
+  await exec(OPENSSL, ['req', '-new', '-key', key, '-out', at('leaf.csr'), '-subj', '/CN=127.0.0.1'])
+  // 820 days: macOS refuses TLS leaves valid for more than 825.
+  await exec(OPENSSL, ['x509', '-req', '-in', at('leaf.csr'), '-CA', TLS_CA_PATH, '-CAkey', at('ca-key.pem'), '-set_serial', `0x${Date.now().toString(16)}`, '-out', cert, '-days', '820', '-extfile', at('leaf.ext')])
+  for (const name of ['ca-key.pem', 'leaf.csr', 'ca.cnf', 'leaf.ext']) rmSync(at(name), { force: true })
+}
+
 export async function shimStatus(): Promise<ShimStatus> {
   return { installed: existsSync(PLIST_PATH), running: await responding(), port: SHIM_PORT }
 }
@@ -86,6 +154,8 @@ export async function installShim(): Promise<ShimStatus> {
   rmSync(REMOVE_PENDING_PATH, { force: true })
   mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 })
   copyFileSync(sourceScript(), SCRIPT_PATH)
+  // Without a certificate the shim still serves plain HTTP; only Codex 0.158+ needs TLS.
+  await ensureCertificate().catch((e) => console.warn(`[shim] no TLS certificate: ${e instanceof Error ? e.message : e}`))
   mkdirSync(join(homedir(), 'Library/LaunchAgents'), { recursive: true })
   writeFileSync(PLIST_PATH, plist(await nodePath()), { mode: 0o644 })
 
@@ -130,10 +200,13 @@ async function liveShimConsumers(): Promise<number[] | null> {
         // No process with this name is running.
       }
       for (const pid of pids) {
-        const usesShim =
-          name === 'claude'
-            ? (await processEnv(pid)).ANTHROPIC_BASE_URL === `${SHIM_URL}/claude`
-            : (await processCommand(pid)).includes(`${SHIM_URL}/codex`)
+        let usesShim: boolean
+        if (name === 'claude') {
+          usesShim = (await processEnv(pid)).ANTHROPIC_BASE_URL === `${SHIM_URL}/claude`
+        } else {
+          const command = await processCommand(pid)
+          usesShim = [LEGACY_CODEX_BASE, CODEX_BASE].some((base) => command.includes(base))
+        }
         if (usesShim) consumers.add(pid)
       }
     }
@@ -210,30 +283,34 @@ function writeClaudeConfig(url: string | null): void {
   writeFileSync(CLAUDE_SETTINGS, `${JSON.stringify(settings, null, 2)}\n`)
 }
 
+/** A `chatgpt_base_url` line Aliax wrote: the TLS base, or the plain one it replaces. */
+const isAliaxCodexLine = (line: string | undefined): boolean =>
+  [LEGACY_CODEX_BASE, CODEX_BASE].some((base) => line?.trim() === `chatgpt_base_url = "${base}"`)
+
 /** Same for Codex, whose base URL is a top-level config key. */
-function writeCodexConfig(url: string | null): void {
+function writeCodexConfig(enabled: boolean): void {
   if (!existsSync(CODEX_CONFIG)) return
   const lines = readFileSync(CODEX_CONFIG, 'utf8').split('\n')
-  if (url) {
+  if (enabled) {
     const existing = lines.find((line) => line.trimStart().startsWith('chatgpt_base_url'))
-    if (existing && existing.trim() !== `chatgpt_base_url = "${url}/codex"`) {
+    if (existing && !isAliaxCodexLine(existing)) {
       throw new Error('Codex already has a custom chatgpt_base_url; Aliax left it unchanged')
     }
-    if (existing) return
+    if (existing?.trim() === `chatgpt_base_url = "${CODEX_BASE}"`) return
   }
   const kept: string[] = []
   for (let i = 0; i < lines.length; i++) {
     if (lines[i] === TOML_MARK) {
-      if (lines[i + 1]?.trim() === `chatgpt_base_url = "${SHIM_URL}/codex"`) i++
+      if (isAliaxCodexLine(lines[i + 1])) i++
       continue
     }
     kept.push(lines[i])
   }
-  if (url) {
+  if (enabled) {
     // Top-level keys must precede the first [table] header.
     const firstTable = kept.findIndex((l) => l.trimStart().startsWith('['))
     const at = firstTable === -1 ? kept.length : firstTable
-    kept.splice(at, 0, TOML_MARK, `chatgpt_base_url = "${url}/codex"`, '')
+    kept.splice(at, 0, TOML_MARK, `chatgpt_base_url = "${CODEX_BASE}"`, '')
   }
   writeFileSync(CODEX_CONFIG, kept.join('\n'))
 }
@@ -258,7 +335,7 @@ export function assertCliConfigWritable(): void {
     const existing = readFileSync(CODEX_CONFIG, 'utf8')
       .split('\n')
       .find((line) => line.trimStart().startsWith('chatgpt_base_url'))
-    if (existing && existing.trim() !== `chatgpt_base_url = "${SHIM_URL}/codex"`) {
+    if (existing && !isAliaxCodexLine(existing)) {
       throw new Error('Codex already has a custom chatgpt_base_url; Aliax left it unchanged')
     }
   }
@@ -267,7 +344,7 @@ export function assertCliConfigWritable(): void {
 export function writeCliConfig(enabled: boolean): void {
   if (enabled) assertCliConfigWritable()
   writeClaudeConfig(enabled ? SHIM_URL : null)
-  writeCodexConfig(enabled ? SHIM_URL : null)
+  writeCodexConfig(enabled)
 }
 
 export function cliConfigInstalled(): boolean {

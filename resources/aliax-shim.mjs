@@ -11,14 +11,21 @@
  * It holds no credentials and makes no decisions. With Aliax closed it is a
  * plain pipe to the provider, so quitting or crashing Aliax can never break a
  * CLI. Installed and removed by Aliax; safe to kill at any time.
+ *
+ * Codex 0.158+ refuses a ChatGPT base that is not HTTPS, so when a
+ * certificate sits in ~/.aliax/tls the same handler also listens with TLS on
+ * ALIAX_SHIM_TLS_PORT (8789). The certificate is Aliax's own local CA's leaf
+ * for 127.0.0.1; the user trusts the CA in Keychain once.
  */
 import { createServer, request as httpRequest } from 'node:http'
-import { request as httpsRequest } from 'node:https'
-import { readFileSync } from 'node:fs'
+import { createServer as createTlsServer, request as httpsRequest } from 'node:https'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 const PORT = Number(process.env.ALIAX_SHIM_PORT ?? 8787)
+const TLS_PORT = Number(process.env.ALIAX_SHIM_TLS_PORT ?? 8789)
+const TLS_DIR = process.env.ALIAX_SHIM_TLS_DIR ?? join(homedir(), '.aliax', 'tls')
 const MARKER = join(homedir(), '.aliax', 'proxy.json')
 
 const DIRECT = {
@@ -53,8 +60,12 @@ function directPath(service, rest) {
   return tail.startsWith('/ps/') ? tail : `/wham${tail}`
 }
 
-const server = createServer((req, res) => {
-  const url = req.url ?? '/'
+function handle(req, res) {
+  let url = req.url ?? '/'
+  // Codex 0.158+ keeps only the origin of its ChatGPT base and addresses
+  // <origin>/backend-api/... itself, dropping our /codex segment: that is
+  // the codex service, the way the gateway already reads /codex/codex/*.
+  if (url === '/backend-api' || url.startsWith('/backend-api/')) url = `/codex${url.slice('/backend-api'.length)}`
   const slash = url.indexOf('/', 1)
   const service = url.slice(1, slash === -1 ? undefined : slash)
   const rest = slash === -1 ? '' : url.slice(slash)
@@ -105,12 +116,25 @@ const server = createServer((req, res) => {
     res.end(JSON.stringify({ error: { type: 'aliax_shim', message: e.message } }))
   })
   req.pipe(upstream)
-})
+}
 
-// Model turns run long; never time one out.
-server.requestTimeout = 0
-server.headersTimeout = 0
-server.setTimeout(0)
-server.listen(PORT, '127.0.0.1', () => {
-  process.stdout.write(`aliax-shim listening on 127.0.0.1:${PORT}\n`)
-})
+/** Model turns run long; never time one out. */
+function listen(server, port, scheme) {
+  server.requestTimeout = 0
+  server.headersTimeout = 0
+  server.setTimeout(0)
+  server.listen(port, '127.0.0.1', () => {
+    process.stdout.write(`aliax-shim listening on ${scheme}://127.0.0.1:${port}\n`)
+  })
+}
+
+listen(createServer(handle), PORT, 'http')
+
+const cert = join(TLS_DIR, 'cert.pem')
+const key = join(TLS_DIR, 'key.pem')
+if (existsSync(cert) && existsSync(key)) {
+  const tls = createTlsServer({ cert: readFileSync(cert), key: readFileSync(key) }, handle)
+  // A bad certificate or a taken port costs only the HTTPS listener.
+  tls.on('error', (e) => process.stdout.write(`aliax-shim https: ${e.message}\n`))
+  listen(tls, TLS_PORT, 'https')
+}
