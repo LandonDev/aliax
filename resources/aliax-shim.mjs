@@ -40,6 +40,19 @@ function gateway() {
   }
 }
 
+/**
+ * Codex addresses a base without a /backend-api marker (us) as
+ * <base>/api/codex/...: the connector runtime (/api/codex/ps/*) lives at
+ * /backend-api/ps/*, and the account endpoints Codex 0.156+ reads before
+ * every turn (/api/codex/accounts/check, /api/codex/settings/user, ...) live
+ * at /backend-api/wham/*. Mirrors splitPath in aliax-core.
+ */
+function directPath(service, rest) {
+  if (service !== 'codex' || !rest.startsWith('/api/codex/')) return rest
+  const tail = rest.slice('/api/codex'.length)
+  return tail.startsWith('/ps/') ? tail : `/wham${tail}`
+}
+
 const server = createServer((req, res) => {
   const url = req.url ?? '/'
   const slash = url.indexOf('/', 1)
@@ -79,7 +92,7 @@ const server = createServer((req, res) => {
       service === 'codex' && rest.startsWith('/v1/') ? DIRECT.codexV1 : DIRECT[service]
     headers.host = target.host
     upstream = httpsRequest(
-      { host: target.host, port: 443, path: `${target.prefix}${rest}`, method: req.method, headers },
+      { host: target.host, port: 443, path: `${target.prefix}${directPath(service, rest)}`, method: req.method, headers },
       (up) => {
         res.writeHead(up.statusCode ?? 502, up.headers)
         up.pipe(res)
