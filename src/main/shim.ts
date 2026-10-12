@@ -142,6 +142,30 @@ async function ensureCertificate(): Promise<void> {
   for (const name of ['ca-key.pem', 'leaf.csr', 'ca.cnf', 'leaf.ext']) rmSync(at(name), { force: true })
 }
 
+/**
+ * `launchctl bootout` returns before launchd has finished tearing the old
+ * instance down, and a bootstrap of the same label in that gap fails with
+ * "Bootstrap failed: 5: Input/output error" (reproduced on 2026-10-12: the
+ * v0.1.17 launch-time reinstall hit it and left the helper unloaded, so every
+ * CLI pointed at 8787/8789 got ECONNREFUSED). Retry until launchd lists the
+ * label, for up to five seconds.
+ */
+async function bootstrap(uid: number): Promise<void> {
+  const loaded = (): Promise<boolean> => exec('launchctl', ['print', `gui/${uid}/${LABEL}`]).then(() => true, () => false)
+  let lastError: unknown
+  for (let i = 0; i < 20; i++) {
+    try {
+      await exec('launchctl', ['bootstrap', `gui/${uid}`, PLIST_PATH])
+      return
+    } catch (error) {
+      lastError = error
+      if (await loaded()) return
+      await new Promise((r) => setTimeout(r, 250))
+    }
+  }
+  throw lastError
+}
+
 export async function shimStatus(): Promise<ShimStatus> {
   return { installed: existsSync(PLIST_PATH), running: await responding(), port: SHIM_PORT }
 }
@@ -162,7 +186,7 @@ export async function installShim(): Promise<ShimStatus> {
   const uid = process.getuid?.() ?? 501
   // bootout first so a reinstall picks up a changed script or node path.
   await exec('launchctl', ['bootout', `gui/${uid}/${LABEL}`]).catch(() => {})
-  await exec('launchctl', ['bootstrap', `gui/${uid}`, PLIST_PATH])
+  await bootstrap(uid)
   for (let i = 0; i < 20 && !(await responding()); i++) {
     await new Promise((r) => setTimeout(r, 250))
   }
