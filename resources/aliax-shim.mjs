@@ -123,6 +123,14 @@ function listen(server, port, scheme) {
   server.requestTimeout = 0
   server.headersTimeout = 0
   server.setTimeout(0)
+  // Codex 0.155+ first opens a WebSocket to its origin for the sampling
+  // stream. The shim speaks HTTP only, so the upgrade is refused at once and
+  // codex falls back to its HTTP stream in the same turn. Left to the request
+  // handler, the upgrade was forwarded as a plain GET and never answered 101,
+  // so codex retried five times ("Reconnecting... n/5") before every turn.
+  server.on('upgrade', (req, socket) => {
+    socket.end('HTTP/1.1 426 Upgrade Required\r\nconnection: close\r\n\r\n')
+  })
   server.listen(port, '127.0.0.1', () => {
     process.stdout.write(`aliax-shim listening on ${scheme}://127.0.0.1:${port}\n`)
   })

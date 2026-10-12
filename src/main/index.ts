@@ -4,7 +4,7 @@ import { statSync, watch } from 'node:fs'
 import { accounts, configure, getSettings, saveSettings } from 'aliax-core'
 import { registerIpc } from './ipc'
 import { clearRuntimeFile, role, startProxy, stopProxy } from './proxy'
-import { resumePendingRemoval } from './shim'
+import { refreshShim, resumePendingRemoval } from './shim'
 import { broadcast, setBroadcast } from './events'
 import { recordAppEvent, recordUsage } from './stats/store'
 import { createTray, refreshTray } from './tray'
@@ -141,7 +141,9 @@ app.whenReady().then(() => {
   createWindow()
   createTray(showWindow)
   startUpdater()
-  resumePendingRemoval().catch(() => {})
+  resumePendingRemoval()
+    .then(refreshShim)
+    .catch((e) => console.warn(`[shim] refresh failed: ${e instanceof Error ? e.message : e}`))
   if (getSettings().proxyEnabled) startProxy().catch(() => {})
   watchDataDir()
 

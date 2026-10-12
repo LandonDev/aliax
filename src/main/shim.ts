@@ -253,6 +253,18 @@ export async function resumePendingRemoval(): Promise<void> {
   else scheduleDeferredRemoval()
 }
 
+/**
+ * Reinstall the helper when this build ships a different script than the one
+ * running, so a shim fix reaches users on their next launch instead of waiting
+ * for them to turn instant switching off and on. Skipped when the helper is
+ * not installed or is on its way out.
+ */
+export async function refreshShim(): Promise<void> {
+  if (!existsSync(PLIST_PATH) || existsSync(REMOVE_PENDING_PATH) || !existsSync(SCRIPT_PATH)) return
+  if (readFileSync(SCRIPT_PATH, 'utf8') === readFileSync(sourceScript(), 'utf8')) return
+  await installShim()
+}
+
 // --- CLI config: the part that reaches GUI-launched sessions ---
 
 const CLAUDE_SETTINGS = join(homedir(), '.claude', 'settings.json')
